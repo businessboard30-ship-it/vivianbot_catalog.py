@@ -11,24 +11,19 @@ from telegram.ext import (
 )
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-import os
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 PAYSTACK_SECRET = os.environ["PAYSTACK_SECRET"]
 ADMIN_ID        = 8162426062
 CATALOG_FILE    = "catalog.json"
-PAGE_SIZE       = 5   # listings shown per "page" in catalog
+GRID_SIZE       = 6
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-# ── CONVERSATION STATES (admin upload flow) ───────────────────────────────────
+# ── CONVERSATION STATES ───────────────────────────────────────────────────────
 (
     ASK_NAME, ASK_AGE, ASK_LOCATION, ASK_COLOR,
     ASK_HEIGHT, ASK_HOURS, ASK_PHONE, ASK_PRICE, ASK_BIO,
-    CONFIRM_DELETE
-) = range(10)
+) = range(9)
 
 # ── CATALOG PERSISTENCE ───────────────────────────────────────────────────────
 def load_catalog() -> list:
@@ -65,24 +60,13 @@ async def init_paystack(amount_ghs: float, label: str, email: str = "customer@vi
         async with httpx.AsyncClient() as client:
             r = await client.post(
                 "https://api.paystack.co/transaction/initialize",
-                headers={
-                    "Authorization": f"Bearer {PAYSTACK_SECRET}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "email": email,
-                    "amount": int(amount_ghs * 100),
-                    "currency": "GHS",
-                    "metadata": {"listing": label},
-                },
+                headers={"Authorization": f"Bearer {PAYSTACK_SECRET}", "Content-Type": "application/json"},
+                json={"email": email, "amount": int(amount_ghs * 100), "currency": "GHS", "metadata": {"listing": label}},
                 timeout=15,
             )
             data = r.json()
             if data.get("status"):
-                return {
-                    "url": data["data"]["authorization_url"],
-                    "reference": data["data"]["reference"],
-                }
+                return {"url": data["data"]["authorization_url"], "reference": data["data"]["reference"]}
     except Exception as e:
         logging.error(f"Paystack init error: {e}")
     return None
@@ -95,134 +79,129 @@ async def verify_paystack(reference: str) -> bool:
                 headers={"Authorization": f"Bearer {PAYSTACK_SECRET}"},
                 timeout=15,
             )
-            data = r.json()
-            return data.get("data", {}).get("status") == "success"
+            return r.json().get("data", {}).get("status") == "success"
     except Exception as e:
         logging.error(f"Paystack verify error: {e}")
     return False
 
-# ── CARD BUILDER ──────────────────────────────────────────────────────────────
+# ── CARD TEXT ─────────────────────────────────────────────────────────────────
 def build_card_text(e: dict) -> str:
-    lines = [
-        f"👤 *{e['name']}, {e['age']}* — {e['location']}",
-        "",
-        f"🎨 Color: {e['color']}",
-        f"📏 Height: {e['height']}",
-        f"⏰ Hours: {e['hours']}",
-        f"💬 {e['bio']}",
-        "",
-        f"💰 Price: *GHS {e['price']}*",
-    ]
-    return "\n".join(lines)
+    return "\n".join([
+        f"╔══════════════════════╗",
+        f"  ✦ *{e['name'].upper()}*  •  {e['age']} yrs",
+        f"╚══════════════════════╝",
+        f"",
+        f"📍 *Location* ›  {e['location']}",
+        f"🎨 *Color* ›  {e['color']}",
+        f"📏 *Height* ›  {e['height']}",
+        f"⏱ *Available* ›  {e['hours']}",
+        f"",
+        f"💭 _{e['bio']}_",
+        f"",
+        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"💎  *RATE:  GHS {e['price']}*",
+        f"━━━━━━━━━━━━━━━━━━━━━━",
+    ])
 
+# ── CARD KEYBOARD (futuristic) ────────────────────────────────────────────────
 def build_card_keyboard(e: dict) -> InlineKeyboardMarkup:
-    lid = e["id"]
+    lid   = e["id"]
     phone = e["phone"]
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🛒 Order", callback_data=f"order|{lid}"),
-            InlineKeyboardButton("📞 Call",  url=f"tel:{phone}"),
-            InlineKeyboardButton("💬 Message", url=f"https://t.me/+{phone}"),
-        ]
+            InlineKeyboardButton("⚡ BOOK NOW",      callback_data=f"order|{lid}"),
+        ],
+        [
+            InlineKeyboardButton("📲 CALL",           url=f"tel:{phone}"),
+            InlineKeyboardButton("💬 MESSAGE",         url=f"https://t.me/+{phone}"),
+        ],
+        [
+            InlineKeyboardButton("◀  BACK TO CATALOG", callback_data="back|0"),
+        ],
     ])
 
-# ── CATALOG DISPLAY ───────────────────────────────────────────────────────────
-async def send_catalog(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, page: int = 0):
+# ── WELCOME KEYBOARD ──────────────────────────────────────────────────────────
+def welcome_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔥 BROWSE CATALOG",    callback_data="page|0")],
+        [
+            InlineKeyboardButton("📞 CONTACT US",     url="https://t.me/+233000000000"),  # update with your number
+            InlineKeyboardButton("ℹ️ HOW IT WORKS",   callback_data="howto"),
+        ],
+    ])
+
+# ── GRID DISPLAY ─────────────────────────────────────────────────────────────
+async def send_grid(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, page: int = 0):
     catalog = load_catalog()
     if not catalog:
-        await ctx.bot.send_message(
-            chat_id,
-            "😔 No listings yet. Check back soon!",
-        )
+        await ctx.bot.send_message(chat_id, "😔 No listings yet. Check back soon!")
         return
 
-    start = page * PAGE_SIZE
-    chunk = catalog[start: start + PAGE_SIZE]
-
-    if page == 0:
-        await ctx.bot.send_message(
-            chat_id,
-            "🛍️ *Welcome! Browse our listings below.*\n"
-            "Tap *Order* to book, *Call* or *Message* for any girl you like 👇",
-            parse_mode="Markdown",
-        )
-
-    for e in chunk:
-        text = build_card_text(e)
-        kb   = build_card_keyboard(e)
-        try:
-            await ctx.bot.send_photo(
-                chat_id,
-                photo=e["photo_id"],
-                caption=text,
-                parse_mode="Markdown",
-                reply_markup=kb,
-            )
-        except Exception as err:
-            logging.error(f"Failed to send card {e['id']}: {err}")
-
-    # Pagination
+    start = page * GRID_SIZE
+    chunk = catalog[start: start + GRID_SIZE]
     total = len(catalog)
-    nav_buttons = []
-    if start + PAGE_SIZE < total:
-        nav_buttons.append(
-            InlineKeyboardButton("➡️ More listings", callback_data=f"page|{page+1}")
-        )
-    if page > 0:
-        nav_buttons.insert(0,
-            InlineKeyboardButton("⬅️ Back", callback_data=f"page|{page-1}")
-        )
 
-    if nav_buttons:
-        await ctx.bot.send_message(
-            chat_id,
-            f"Showing {start+1}–{min(start+PAGE_SIZE, total)} of {total} listings",
-            reply_markup=InlineKeyboardMarkup([nav_buttons]),
-        )
+    # Album of thumbnails
+    media = []
+    for i, e in enumerate(chunk):
+        cap = f"✦ {e['name']}, {e['age']}  |  {e['location']}" if i == 0 else f"✦ {e['name']}, {e['age']}  |  {e['location']}"
+        media.append(InputMediaPhoto(media=e["photo_id"], caption=cap))
+
+    try:
+        await ctx.bot.send_media_group(chat_id, media=media)
+    except Exception as err:
+        logging.error(f"Media group error: {err}")
+
+    # Name selector buttons — 2 per row, futuristic style
+    name_buttons = []
+    row = []
+    for e in chunk:
+        row.append(InlineKeyboardButton(
+            f"✦ {e['name'].upper()}  {e['age']}",
+            callback_data=f"profile|{e['id']}"
+        ))
+        if len(row) == 2:
+            name_buttons.append(row)
+            row = []
+    if row:
+        name_buttons.append(row)
+
+    # Nav row
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀  PREV",   callback_data=f"page|{page-1}"))
+    if start + GRID_SIZE < total:
+        nav.append(InlineKeyboardButton("NEXT  ▶",   callback_data=f"page|{page+1}"))
+    if nav:
+        name_buttons.append(nav)
+
+    await ctx.bot.send_message(
+        chat_id,
+        f"◈  *{start+1} – {min(start+GRID_SIZE, total)} of {total} AVAILABLE*  ◈\n"
+        f"_Tap a name to view full profile_",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(name_buttons),
+    )
 
 # ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    first = user.first_name or "there"
     await update.message.reply_text(
-        "👋 Welcome! Here's our catalog — scroll through and pick who you like 😍",
-    )
-    await send_catalog(update.effective_chat.id, ctx, page=0)
-
-# ── /catalog ──────────────────────────────────────────────────────────────────
-async def catalog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await send_catalog(update.effective_chat.id, ctx, page=0)
-
-# ── /delete ───────────────────────────────────────────────────────────────────
-async def delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text("⛔ Admin only.")
-        return ConversationHandler.END
-
-    args = ctx.args
-    if not args or not args[0].isdigit():
-        await update.message.reply_text(
-            "Usage: `/delete <listing_id>`\nUse /list to see IDs.",
-            parse_mode="Markdown"
-        )
-        return ConversationHandler.END
-
-    lid = int(args[0])
-    entry = get_listing(lid)
-    if not entry:
-        await update.message.reply_text(f"❌ No listing with ID {lid} found.")
-        return ConversationHandler.END
-
-    ctx.user_data["delete_id"] = lid
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirmdelete|{lid}"),
-        InlineKeyboardButton("❌ Cancel", callback_data="canceldelete"),
-    ]])
-    await update.message.reply_text(
-        f"⚠️ Are you sure you want to delete *{entry['name']}* (ID: {lid})?",
+        f"🌟 *Welcome, {first}!*\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"You've entered an *exclusive catalog*.\n"
+        f"Browse, choose, and book in seconds.\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"_What would you like to do?_",
         parse_mode="Markdown",
-        reply_markup=kb,
+        reply_markup=welcome_keyboard(),
     )
 
-# ── /list (admin) ─────────────────────────────────────────────────────────────
+async def catalog_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await send_grid(update.effective_chat.id, ctx, page=0)
+
+# ── /list & /delete (admin) ───────────────────────────────────────────────────
 async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Admin only.")
@@ -236,26 +215,36 @@ async def list_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"• ID `{e['id']}` — *{e['name']}*, {e['age']}, {e['location']}")
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
-# ── ADMIN UPLOAD FLOW ──────────────────────────────────────────────────────────
-async def handle_admin_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Entry point: admin sends a photo."""
+async def delete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
-        await update.message.reply_text(
-            "👋 I'm a private catalog bot. Use /start to browse listings."
-        )
-        return ConversationHandler.END
-
-    # Save the highest-res photo file_id
-    photo = update.message.photo[-1]
-    ctx.user_data["photo_id"] = photo.file_id
-    ctx.user_data["listing"] = {}
-
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    args = ctx.args
+    if not args or not args[0].isdigit():
+        await update.message.reply_text("Usage: `/delete <listing_id>`\nUse /list to see IDs.", parse_mode="Markdown")
+        return
+    lid   = int(args[0])
+    entry = get_listing(lid)
+    if not entry:
+        await update.message.reply_text(f"❌ No listing with ID {lid} found.")
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Yes, delete", callback_data=f"confirmdelete|{lid}"),
+        InlineKeyboardButton("❌ Cancel",       callback_data="canceldelete"),
+    ]])
     await update.message.reply_text(
-        "📸 Got the photo!\n\n"
-        "Let's add the details step by step.\n\n"
-        "➡️ *What is her name?*",
-        parse_mode="Markdown"
+        f"⚠️ Delete *{entry['name']}* (ID: {lid})?",
+        parse_mode="Markdown", reply_markup=kb,
     )
+
+# ── ADMIN UPLOAD FLOW ─────────────────────────────────────────────────────────
+async def handle_admin_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("👋 Use /start to browse.")
+        return ConversationHandler.END
+    ctx.user_data["photo_id"] = update.message.photo[-1].file_id
+    ctx.user_data["listing"]  = {}
+    await update.message.reply_text("📸 Photo received!\n\n➡️ *Her name?*", parse_mode="Markdown")
     return ASK_NAME
 
 async def ask_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -270,7 +259,7 @@ async def ask_age(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def ask_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["listing"]["location"] = update.message.text.strip()
-    await update.message.reply_text("➡️ *Color (e.g. skin tone / complexion)?*", parse_mode="Markdown")
+    await update.message.reply_text("➡️ *Color / complexion?*", parse_mode="Markdown")
     return ASK_COLOR
 
 async def ask_color(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -285,7 +274,7 @@ async def ask_height(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def ask_hours(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data["listing"]["hours"] = update.message.text.strip()
-    await update.message.reply_text("➡️ *Phone number? (include country code, e.g. 233241234567)*", parse_mode="Markdown")
+    await update.message.reply_text("➡️ *Phone number? (with country code e.g. 233241234567)*", parse_mode="Markdown")
     return ASK_PHONE
 
 async def ask_phone(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -298,26 +287,24 @@ async def ask_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try:
         ctx.user_data["listing"]["price"] = float(raw)
     except ValueError:
-        await update.message.reply_text("⚠️ Please enter a valid number for price.")
+        await update.message.reply_text("⚠️ Please enter a valid number.")
         return ASK_PRICE
-    await update.message.reply_text("➡️ *Short description / bio?*", parse_mode="Markdown")
+    await update.message.reply_text("➡️ *Short bio / description?*", parse_mode="Markdown")
     return ASK_BIO
 
 async def ask_bio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["listing"]["bio"] = update.message.text.strip()
+    ctx.user_data["listing"]["bio"]      = update.message.text.strip()
     ctx.user_data["listing"]["photo_id"] = ctx.user_data["photo_id"]
-
-    # Preview to admin
-    e = ctx.user_data["listing"]
-    e["id"] = 0  # temporary for preview
+    e       = ctx.user_data["listing"]
+    e["id"] = 0
     preview = build_card_text(e)
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Save listing", callback_data="savelisting"),
-        InlineKeyboardButton("❌ Cancel", callback_data="cancellisting"),
+        InlineKeyboardButton("✅ SAVE",   callback_data="savelisting"),
+        InlineKeyboardButton("❌ CANCEL", callback_data="cancellisting"),
     ]])
     await update.message.reply_photo(
         photo=e["photo_id"],
-        caption=f"*Preview:*\n\n{preview}\n\nSave this listing?",
+        caption=f"*── PREVIEW ──*\n\n{preview}\n\nSave this listing?",
         parse_mode="Markdown",
         reply_markup=kb,
     )
@@ -335,108 +322,127 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data  = query.data
     uid   = query.from_user.id
 
-    # ── Save listing (admin) ──
     if data == "savelisting":
         if uid != ADMIN_ID:
             return
         entry = ctx.user_data.get("listing", {})
         if not entry:
-            await query.message.reply_text("⚠️ No listing data found. Please re-upload.")
+            await query.message.reply_text("⚠️ No listing data. Please re-upload.")
             return
         lid = add_listing(entry)
-        await query.message.reply_text(
-            f"✅ Listing *{entry['name']}* saved! ID: `{lid}`",
-            parse_mode="Markdown"
-        )
+        await query.message.reply_text(f"✅ *{entry['name']}* saved! ID: `{lid}`", parse_mode="Markdown")
         ctx.user_data.clear()
 
-    # ── Cancel listing (admin) ──
     elif data == "cancellisting":
         if uid != ADMIN_ID:
             return
         ctx.user_data.clear()
         await query.message.reply_text("❌ Listing cancelled.")
 
-    # ── Confirm delete ──
     elif data.startswith("confirmdelete|"):
         if uid != ADMIN_ID:
             return
-        lid = int(data.split("|")[1])
+        lid   = int(data.split("|")[1])
         entry = get_listing(lid)
-        name = entry["name"] if entry else str(lid)
+        name  = entry["name"] if entry else str(lid)
         if remove_listing(lid):
-            await query.message.edit_text(f"🗑️ *{name}* (ID: {lid}) has been removed.", parse_mode="Markdown")
+            await query.message.edit_text(f"🗑️ *{name}* (ID: {lid}) removed.", parse_mode="Markdown")
         else:
-            await query.message.edit_text(f"⚠️ Listing ID {lid} not found.")
+            await query.message.edit_text(f"⚠️ Listing {lid} not found.")
 
-    # ── Cancel delete ──
     elif data == "canceldelete":
         await query.message.edit_text("👌 Delete cancelled.")
 
-    # ── Pagination ──
+    elif data == "howto":
+        await ctx.bot.send_message(
+            uid,
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "⚡ *HOW IT WORKS*\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "1️⃣  Browse the catalog\n"
+            "2️⃣  Tap a name to view her full profile\n"
+            "3️⃣  Tap *⚡ BOOK NOW* to pay securely\n"
+            "4️⃣  After payment, you'll be contacted\n\n"
+            "📞 Questions? Tap *CONTACT US* on the main menu.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔥 BROWSE CATALOG", callback_data="page|0")
+            ]])
+        )
+
     elif data.startswith("page|"):
         page = int(data.split("|")[1])
-        await send_catalog(query.message.chat_id, ctx, page=page)
+        await send_grid(query.message.chat_id, ctx, page=page)
 
-    # ── Order button ──
-    elif data.startswith("order|"):
-        lid = int(data.split("|")[1])
+    elif data.startswith("back|"):
+        page = int(data.split("|")[1])
+        await send_grid(query.message.chat_id, ctx, page=page)
+
+    elif data.startswith("profile|"):
+        lid   = int(data.split("|")[1])
         entry = get_listing(lid)
         if not entry:
             await ctx.bot.send_message(uid, "⚠️ This listing is no longer available.")
             return
+        await ctx.bot.send_photo(
+            uid,
+            photo=entry["photo_id"],
+            caption=build_card_text(entry),
+            parse_mode="Markdown",
+            reply_markup=build_card_keyboard(entry),
+        )
 
-        await ctx.bot.send_message(uid, f"⏳ Setting up payment for *{entry['name']}*…", parse_mode="Markdown")
-
+    elif data.startswith("order|"):
+        lid   = int(data.split("|")[1])
+        entry = get_listing(lid)
+        if not entry:
+            await ctx.bot.send_message(uid, "⚠️ This listing is no longer available.")
+            return
+        await ctx.bot.send_message(uid, f"⚡ _Generating your payment link for *{entry['name']}*…_", parse_mode="Markdown")
         txn = await init_paystack(entry["price"], entry["name"])
         if not txn:
-            await ctx.bot.send_message(uid, "⚠️ Payment setup failed. Please try again later.")
+            await ctx.bot.send_message(uid, "⚠️ Payment setup failed. Try again later.")
             return
-
-        # Store reference for verification
-        if "pending" not in ctx.bot_data:
-            ctx.bot_data["pending"] = {}
-        ctx.bot_data["pending"][uid] = {"ref": txn["reference"], "listing": entry}
-
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 Pay Now", url=txn["url"])],
-            [InlineKeyboardButton("✅ I've Paid — Verify", callback_data=f"verify|{txn['reference']}|{lid}")],
+            [InlineKeyboardButton("💳  PAY SECURELY NOW", url=txn["url"])],
+            [InlineKeyboardButton("✅  I'VE PAID — VERIFY", callback_data=f"verify|{txn['reference']}|{lid}")],
+            [InlineKeyboardButton("◀  BACK TO PROFILE",   callback_data=f"profile|{lid}")],
         ])
         await ctx.bot.send_message(
             uid,
-            f"🛒 *Order: {entry['name']}*\n\n"
-            f"💰 Amount: *GHS {entry['price']}*\n\n"
-            f"Tap *Pay Now* to complete securely via Paystack.\n"
-            f"Then tap *I've Paid — Verify* to confirm. 🎉",
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"⚡ *BOOKING:  {entry['name'].upper()}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"💎  Amount:  *GHS {entry['price']}*\n\n"
+            f"Tap *PAY SECURELY NOW* to complete via Paystack.\n"
+            f"Then tap *I'VE PAID — VERIFY* to confirm. 🎉",
             parse_mode="Markdown",
             reply_markup=kb,
         )
 
-    # ── Verify payment ──
     elif data.startswith("verify|"):
         parts     = data.split("|")
         reference = parts[1]
         lid       = int(parts[2])
         entry     = get_listing(lid)
-
-        await ctx.bot.send_message(uid, "🔍 Verifying your payment…")
+        await ctx.bot.send_message(uid, "🔍 _Verifying your payment…_", parse_mode="Markdown")
         success = await verify_paystack(reference)
-
         if success:
             name = entry["name"] if entry else "the listing"
             await ctx.bot.send_message(
                 uid,
-                f"🎉 *Payment confirmed!*\n\n"
-                f"Thank you! Your booking for *{name}* has been received.\n"
-                f"You'll be contacted shortly. ✅",
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"🎉 *PAYMENT CONFIRMED!*\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"Your booking for *{name}* is locked in.\n"
+                f"You will be contacted shortly. ✅",
                 parse_mode="Markdown",
             )
-            # Notify admin
             u = query.from_user
             try:
                 await ctx.bot.send_message(
                     ADMIN_ID,
-                    f"💰 *New Order Paid!*\n\n"
+                    f"💰 *NEW ORDER PAID!*\n\n"
                     f"👤 Customer: @{u.username or u.first_name} (ID: `{u.id}`)\n"
                     f"🧾 Listing: *{name}* (ID: {lid})\n"
                     f"💵 Amount: GHS {entry['price'] if entry else 'N/A'}\n"
@@ -447,40 +453,38 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 pass
         else:
             kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🔄 Try Again", callback_data=f"verify|{reference}|{lid}")
+                InlineKeyboardButton("🔄 TRY AGAIN", callback_data=f"verify|{reference}|{lid}")
             ]])
             await ctx.bot.send_message(
                 uid,
-                "❌ Payment not confirmed yet.\n\n"
-                "If you've paid, wait a moment and tap *Try Again*.\n"
+                "❌ *Payment not confirmed yet.*\n\n"
+                "If you've paid, wait a moment and tap *TRY AGAIN*.\n"
                 "Haven't paid yet? Complete payment first. 👆",
                 parse_mode="Markdown",
                 reply_markup=kb,
             )
 
-# ── FALLBACK: non-admin text messages ─────────────────────────────────────────
+# ── FALLBACK TEXT ─────────────────────────────────────────────────────────────
 async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
         await update.message.reply_text(
-            "📸 Send a photo to add a new listing, or use:\n"
-            "/list — see all listings\n"
+            "📸 Send a photo to add a listing, or:\n"
+            "/list — see all listings with IDs\n"
             "/delete <id> — remove a listing\n"
-            "/catalog — view catalog",
+            "/catalog — view the catalog"
         )
     else:
         await update.message.reply_text(
-            "👋 Use /start or /catalog to browse listings!"
+            "👋 Use /start to open the main menu!",
+            reply_markup=welcome_keyboard(),
         )
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    # Admin photo upload conversation
     upload_conv = ConversationHandler(
-        entry_points=[MessageHandler(
-            filters.PHOTO & filters.User(ADMIN_ID), handle_admin_photo
-        )],
+        entry_points=[MessageHandler(filters.PHOTO & filters.User(ADMIN_ID), handle_admin_photo)],
         states={
             ASK_NAME:     [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_name)],
             ASK_AGE:      [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_age)],
