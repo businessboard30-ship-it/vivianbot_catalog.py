@@ -9,21 +9,18 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters, ConversationHandler
 )
-from pymongo import MongoClient
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 PAYSTACK_SECRET = os.environ["PAYSTACK_SECRET"]
-MONGODB_URI     = os.environ["MONGODB_URI"]
 ADMIN_ID        = 8162426062
 GRID_SIZE       = 6
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+# Store catalog.json in /data if it exists (Railway volume), else local
+DATA_DIR     = "/data" if os.path.isdir("/data") else "."
+CATALOG_FILE = os.path.join(DATA_DIR, "catalog.json")
 
-# ── MONGODB SETUP ─────────────────────────────────────────────────────────────
-client     = MongoClient(MONGODB_URI)
-db         = client["vivianbot"]
-collection = db["listings"]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
 # ── CONVERSATION STATES ───────────────────────────────────────────────────────
 (
@@ -39,23 +36,34 @@ def emojify_name(name: str, listing_id: int) -> str:
     emoji = NAME_EMOJIS[(listing_id - 1) % len(NAME_EMOJIS)]
     return f"{emoji} {name} {emoji}"
 
-# ── CATALOG DB FUNCTIONS ──────────────────────────────────────────────────────
+# ── CATALOG PERSISTENCE ───────────────────────────────────────────────────────
 def load_catalog() -> list:
-    return list(collection.find({}, {"_id": 0}).sort("id", 1))
+    if os.path.exists(CATALOG_FILE):
+        with open(CATALOG_FILE, "r") as f:
+            return json.load(f)
+    return []
+
+def save_catalog(data: list):
+    with open(CATALOG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
 
 def add_listing(entry: dict) -> int:
-    last = collection.find_one(sort=[("id", -1)])
-    entry["id"] = (last["id"] + 1) if last else 1
-    collection.insert_one({**entry, "_id": entry["id"]})
+    catalog = load_catalog()
+    entry["id"] = max((e["id"] for e in catalog), default=0) + 1
+    catalog.append(entry)
+    save_catalog(catalog)
     return entry["id"]
 
 def remove_listing(listing_id: int) -> bool:
-    result = collection.delete_one({"id": listing_id})
-    return result.deleted_count > 0
+    catalog = load_catalog()
+    new = [e for e in catalog if e["id"] != listing_id]
+    if len(new) == len(catalog):
+        return False
+    save_catalog(new)
+    return True
 
 def get_listing(listing_id: int) -> dict | None:
-    doc = collection.find_one({"id": listing_id}, {"_id": 0})
-    return doc
+    return next((e for e in load_catalog() if e["id"] == listing_id), None)
 
 # ── PAYSTACK ──────────────────────────────────────────────────────────────────
 async def init_paystack(amount_ghs: float, label: str, email: str = "customer@vivianbot.com") -> dict | None:
@@ -112,19 +120,19 @@ def build_card_keyboard(e: dict) -> InlineKeyboardMarkup:
     lid   = e["id"]
     phone = e["phone"]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚡ BOOK NOW",            callback_data=f"order|{lid}")],
+        [InlineKeyboardButton("⚡ BOOK NOW",           callback_data=f"order|{lid}")],
         [
-            InlineKeyboardButton("📲 CALL",              url=f"tel:{phone}"),
-            InlineKeyboardButton("💬 MESSAGE",            url=f"https://t.me/+{phone}"),
+            InlineKeyboardButton("📲 CALL",             url=f"tel:{phone}"),
+            InlineKeyboardButton("💬 MESSAGE",           url=f"https://t.me/+{phone}"),
         ],
-        [InlineKeyboardButton("◀  BACK TO CATALOG",     callback_data="page|0")],
+        [InlineKeyboardButton("◀  BACK TO CATALOG",    callback_data="page|0")],
     ])
 
 # ── WELCOME KEYBOARD ──────────────────────────────────────────────────────────
 def welcome_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔥 BROWSE CATALOG",      callback_data="page|0")],
-        [InlineKeyboardButton("ℹ️ HOW IT WORKS",        callback_data="howto")],
+        [InlineKeyboardButton("🔥 BROWSE CATALOG",     callback_data="page|0")],
+        [InlineKeyboardButton("ℹ️ HOW IT WORKS",       callback_data="howto")],
     ])
 
 # ── GRID DISPLAY ─────────────────────────────────────────────────────────────
@@ -146,7 +154,6 @@ async def send_grid(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, page: int = 0)
         except Exception as err:
             logging.error(f"Photo send error for {e['id']}: {err}")
 
-    # Name selector buttons
     name_buttons = []
     row = []
     for e in chunk:
@@ -158,7 +165,6 @@ async def send_grid(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, page: int = 0)
     if row:
         name_buttons.append(row)
 
-    # Nav
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀  PREV",  callback_data=f"page|{page-1}"))
@@ -322,7 +328,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.send_message(chat_id, "⚠️ No listing data. Please re-upload.")
             return
         lid = add_listing(entry)
-        await ctx.bot.send_message(chat_id, f"✅ *{entry['name']}* saved to database! ID: `{lid}`", parse_mode="Markdown")
+        await ctx.bot.send_message(chat_id, f"✅ *{entry['name']}* saved! ID: `{lid}`", parse_mode="Markdown")
         ctx.user_data.clear()
 
     elif data == "cancellisting":
@@ -338,7 +344,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         entry = get_listing(lid)
         name  = entry["name"] if entry else str(lid)
         if remove_listing(lid):
-            await query.message.edit_text(f"🗑️ *{name}* (ID: {lid}) removed from database.", parse_mode="Markdown")
+            await query.message.edit_text(f"🗑️ *{name}* (ID: {lid}) removed.", parse_mode="Markdown")
         else:
             await query.message.edit_text(f"⚠️ Listing {lid} not found.")
 
@@ -464,10 +470,7 @@ async def handle_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/catalog — view the catalog"
         )
     else:
-        await update.message.reply_text(
-            "👋 Use /start to open the main menu!",
-            reply_markup=welcome_keyboard(),
-        )
+        await update.message.reply_text("👋 Use /start to open the main menu!", reply_markup=welcome_keyboard())
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -498,5 +501,5 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("✅ Catalog bot is running with MongoDB…")
+    print("✅ Bot is running…")
     app.run_polling()
