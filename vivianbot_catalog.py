@@ -9,15 +9,21 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler,
     CallbackQueryHandler, ContextTypes, filters, ConversationHandler
 )
+from pymongo import MongoClient
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.environ["TELEGRAM_TOKEN"]
 PAYSTACK_SECRET = os.environ["PAYSTACK_SECRET"]
+MONGODB_URI     = os.environ["MONGODB_URI"]
 ADMIN_ID        = 8162426062
-CATALOG_FILE    = "catalog.json"
 GRID_SIZE       = 6
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
+# ── MONGODB SETUP ─────────────────────────────────────────────────────────────
+client     = MongoClient(MONGODB_URI)
+db         = client["vivianbot"]
+collection = db["listings"]
 
 # ── CONVERSATION STATES ───────────────────────────────────────────────────────
 (
@@ -25,34 +31,31 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
     ASK_HEIGHT, ASK_HOURS, ASK_PHONE, ASK_PRICE, ASK_BIO,
 ) = range(9)
 
-# ── CATALOG PERSISTENCE ───────────────────────────────────────────────────────
-def load_catalog() -> list:
-    if os.path.exists(CATALOG_FILE):
-        with open(CATALOG_FILE, "r") as f:
-            return json.load(f)
-    return []
+# ── NAME EMOJIS ───────────────────────────────────────────────────────────────
+NAME_EMOJIS = ["🌸", "💎", "🔥", "✨", "🌺", "💫", "🦋", "🌙", "👑", "🍀",
+               "🌹", "💐", "🌟", "🎀", "🫦", "💋", "🌴", "🦚", "🍓", "🌊"]
 
-def save_catalog(data: list):
-    with open(CATALOG_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def emojify_name(name: str, listing_id: int) -> str:
+    emoji = NAME_EMOJIS[(listing_id - 1) % len(NAME_EMOJIS)]
+    return f"{emoji} {name} {emoji}"
+
+# ── CATALOG DB FUNCTIONS ──────────────────────────────────────────────────────
+def load_catalog() -> list:
+    return list(collection.find({}, {"_id": 0}).sort("id", 1))
 
 def add_listing(entry: dict) -> int:
-    catalog = load_catalog()
-    entry["id"] = max((e["id"] for e in catalog), default=0) + 1
-    catalog.append(entry)
-    save_catalog(catalog)
+    last = collection.find_one(sort=[("id", -1)])
+    entry["id"] = (last["id"] + 1) if last else 1
+    collection.insert_one({**entry, "_id": entry["id"]})
     return entry["id"]
 
 def remove_listing(listing_id: int) -> bool:
-    catalog = load_catalog()
-    new = [e for e in catalog if e["id"] != listing_id]
-    if len(new) == len(catalog):
-        return False
-    save_catalog(new)
-    return True
+    result = collection.delete_one({"id": listing_id})
+    return result.deleted_count > 0
 
 def get_listing(listing_id: int) -> dict | None:
-    return next((e for e in load_catalog() if e["id"] == listing_id), None)
+    doc = collection.find_one({"id": listing_id}, {"_id": 0})
+    return doc
 
 # ── PAYSTACK ──────────────────────────────────────────────────────────────────
 async def init_paystack(amount_ghs: float, label: str, email: str = "customer@vivianbot.com") -> dict | None:
@@ -86,12 +89,13 @@ async def verify_paystack(reference: str) -> bool:
 
 # ── CARD TEXT ─────────────────────────────────────────────────────────────────
 def build_card_text(e: dict) -> str:
+    fancy_name = emojify_name(e['name'], e['id'])
     return "\n".join([
         f"╔══════════════════════╗",
-        f"  ✦ *{e['name'].upper()}*  •  {e['age']} yrs",
+        f"  *{fancy_name}*",
+        f"  _{e['age']} yrs  •  {e['location']}_",
         f"╚══════════════════════╝",
         f"",
-        f"📍 *Location* ›  {e['location']}",
         f"🎨 *Color* ›  {e['color']}",
         f"📏 *Height* ›  {e['height']}",
         f"⏱ *Available* ›  {e['hours']}",
@@ -103,31 +107,24 @@ def build_card_text(e: dict) -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━",
     ])
 
-# ── CARD KEYBOARD (futuristic) ────────────────────────────────────────────────
+# ── CARD KEYBOARD ─────────────────────────────────────────────────────────────
 def build_card_keyboard(e: dict) -> InlineKeyboardMarkup:
     lid   = e["id"]
     phone = e["phone"]
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚡ BOOK NOW",            callback_data=f"order|{lid}")],
         [
-            InlineKeyboardButton("⚡ BOOK NOW",      callback_data=f"order|{lid}"),
+            InlineKeyboardButton("📲 CALL",              url=f"tel:{phone}"),
+            InlineKeyboardButton("💬 MESSAGE",            url=f"https://t.me/+{phone}"),
         ],
-        [
-            InlineKeyboardButton("📲 CALL",           url=f"tel:{phone}"),
-            InlineKeyboardButton("💬 MESSAGE",         url=f"https://t.me/+{phone}"),
-        ],
-        [
-            InlineKeyboardButton("◀  BACK TO CATALOG", callback_data="back|0"),
-        ],
+        [InlineKeyboardButton("◀  BACK TO CATALOG",     callback_data="page|0")],
     ])
 
 # ── WELCOME KEYBOARD ──────────────────────────────────────────────────────────
 def welcome_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔥 BROWSE CATALOG",    callback_data="page|0")],
-        [
-            InlineKeyboardButton("📞 CONTACT US",     url="https://t.me/+233000000000"),  # update with your number
-            InlineKeyboardButton("ℹ️ HOW IT WORKS",   callback_data="howto"),
-        ],
+        [InlineKeyboardButton("🔥 BROWSE CATALOG",      callback_data="page|0")],
+        [InlineKeyboardButton("ℹ️ HOW IT WORKS",        callback_data="howto")],
     ])
 
 # ── GRID DISPLAY ─────────────────────────────────────────────────────────────
@@ -141,52 +138,46 @@ async def send_grid(chat_id: int, ctx: ContextTypes.DEFAULT_TYPE, page: int = 0)
     chunk = catalog[start: start + GRID_SIZE]
     total = len(catalog)
 
-    # Album of thumbnails
-    media = []
-    for i, e in enumerate(chunk):
-        cap = f"✦ {e['name']}, {e['age']}  |  {e['location']}" if i == 0 else f"✦ {e['name']}, {e['age']}  |  {e['location']}"
-        media.append(InputMediaPhoto(media=e["photo_id"], caption=cap))
+    for e in chunk:
+        fancy = emojify_name(e['name'], e['id'])
+        cap   = f"{fancy}\n_{e['age']} yrs  •  {e['location']}_"
+        try:
+            await ctx.bot.send_photo(chat_id, photo=e["photo_id"], caption=cap, parse_mode="Markdown")
+        except Exception as err:
+            logging.error(f"Photo send error for {e['id']}: {err}")
 
-    try:
-        await ctx.bot.send_media_group(chat_id, media=media)
-    except Exception as err:
-        logging.error(f"Media group error: {err}")
-
-    # Name selector buttons — 2 per row, futuristic style
+    # Name selector buttons
     name_buttons = []
     row = []
     for e in chunk:
-        row.append(InlineKeyboardButton(
-            f"✦ {e['name'].upper()}  {e['age']}",
-            callback_data=f"profile|{e['id']}"
-        ))
+        fancy = emojify_name(e['name'], e['id'])
+        row.append(InlineKeyboardButton(fancy, callback_data=f"profile|{e['id']}"))
         if len(row) == 2:
             name_buttons.append(row)
             row = []
     if row:
         name_buttons.append(row)
 
-    # Nav row
+    # Nav
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton("◀  PREV",   callback_data=f"page|{page-1}"))
+        nav.append(InlineKeyboardButton("◀  PREV",  callback_data=f"page|{page-1}"))
     if start + GRID_SIZE < total:
-        nav.append(InlineKeyboardButton("NEXT  ▶",   callback_data=f"page|{page+1}"))
+        nav.append(InlineKeyboardButton("NEXT  ▶",  callback_data=f"page|{page+1}"))
     if nav:
         name_buttons.append(nav)
 
     await ctx.bot.send_message(
         chat_id,
-        f"◈  *{start+1} – {min(start+GRID_SIZE, total)} of {total} AVAILABLE*  ◈\n"
-        f"_Tap a name to view full profile_",
+        f"◈  *{start+1}–{min(start+GRID_SIZE, total)} of {total} AVAILABLE*  ◈\n"
+        f"_👇 Tap a name below to view full profile_",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(name_buttons),
     )
 
 # ── /start ────────────────────────────────────────────────────────────────────
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    first = user.first_name or "there"
+    first = update.effective_user.first_name or "there"
     await update.message.reply_text(
         f"🌟 *Welcome, {first}!*\n\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
@@ -317,27 +308,28 @@ async def cancel_upload(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── CALLBACK HANDLER ──────────────────────────────────────────────────────────
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
+    query   = update.callback_query
     await query.answer()
-    data  = query.data
-    uid   = query.from_user.id
+    data    = query.data
+    uid     = query.from_user.id
+    chat_id = query.message.chat_id
 
     if data == "savelisting":
         if uid != ADMIN_ID:
             return
         entry = ctx.user_data.get("listing", {})
         if not entry:
-            await query.message.reply_text("⚠️ No listing data. Please re-upload.")
+            await ctx.bot.send_message(chat_id, "⚠️ No listing data. Please re-upload.")
             return
         lid = add_listing(entry)
-        await query.message.reply_text(f"✅ *{entry['name']}* saved! ID: `{lid}`", parse_mode="Markdown")
+        await ctx.bot.send_message(chat_id, f"✅ *{entry['name']}* saved to database! ID: `{lid}`", parse_mode="Markdown")
         ctx.user_data.clear()
 
     elif data == "cancellisting":
         if uid != ADMIN_ID:
             return
         ctx.user_data.clear()
-        await query.message.reply_text("❌ Listing cancelled.")
+        await ctx.bot.send_message(chat_id, "❌ Listing cancelled.")
 
     elif data.startswith("confirmdelete|"):
         if uid != ADMIN_ID:
@@ -346,7 +338,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         entry = get_listing(lid)
         name  = entry["name"] if entry else str(lid)
         if remove_listing(lid):
-            await query.message.edit_text(f"🗑️ *{name}* (ID: {lid}) removed.", parse_mode="Markdown")
+            await query.message.edit_text(f"🗑️ *{name}* (ID: {lid}) removed from database.", parse_mode="Markdown")
         else:
             await query.message.edit_text(f"⚠️ Listing {lid} not found.")
 
@@ -355,15 +347,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data == "howto":
         await ctx.bot.send_message(
-            uid,
+            chat_id,
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "⚡ *HOW IT WORKS*\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n\n"
             "1️⃣  Browse the catalog\n"
             "2️⃣  Tap a name to view her full profile\n"
             "3️⃣  Tap *⚡ BOOK NOW* to pay securely\n"
-            "4️⃣  After payment, you'll be contacted\n\n"
-            "📞 Questions? Tap *CONTACT US* on the main menu.",
+            "4️⃣  After payment, you will be contacted\n\n"
+            "📞 Questions? Contact us directly.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("🔥 BROWSE CATALOG", callback_data="page|0")
@@ -372,20 +364,16 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("page|"):
         page = int(data.split("|")[1])
-        await send_grid(query.message.chat_id, ctx, page=page)
-
-    elif data.startswith("back|"):
-        page = int(data.split("|")[1])
-        await send_grid(query.message.chat_id, ctx, page=page)
+        await send_grid(chat_id, ctx, page=page)
 
     elif data.startswith("profile|"):
         lid   = int(data.split("|")[1])
         entry = get_listing(lid)
         if not entry:
-            await ctx.bot.send_message(uid, "⚠️ This listing is no longer available.")
+            await ctx.bot.send_message(chat_id, "⚠️ This listing is no longer available.")
             return
         await ctx.bot.send_photo(
-            uid,
+            chat_id,
             photo=entry["photo_id"],
             caption=build_card_text(entry),
             parse_mode="Markdown",
@@ -396,22 +384,23 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lid   = int(data.split("|")[1])
         entry = get_listing(lid)
         if not entry:
-            await ctx.bot.send_message(uid, "⚠️ This listing is no longer available.")
+            await ctx.bot.send_message(chat_id, "⚠️ This listing is no longer available.")
             return
-        await ctx.bot.send_message(uid, f"⚡ _Generating your payment link for *{entry['name']}*…_", parse_mode="Markdown")
+        await ctx.bot.send_message(chat_id, f"⚡ _Generating payment link for *{entry['name']}*…_", parse_mode="Markdown")
         txn = await init_paystack(entry["price"], entry["name"])
         if not txn:
-            await ctx.bot.send_message(uid, "⚠️ Payment setup failed. Try again later.")
+            await ctx.bot.send_message(chat_id, "⚠️ Payment setup failed. Try again later.")
             return
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳  PAY SECURELY NOW", url=txn["url"])],
+            [InlineKeyboardButton("💳  PAY SECURELY NOW",   url=txn["url"])],
             [InlineKeyboardButton("✅  I'VE PAID — VERIFY", callback_data=f"verify|{txn['reference']}|{lid}")],
-            [InlineKeyboardButton("◀  BACK TO PROFILE",   callback_data=f"profile|{lid}")],
+            [InlineKeyboardButton("◀  BACK TO PROFILE",     callback_data=f"profile|{lid}")],
         ])
+        fancy = emojify_name(entry['name'], entry['id'])
         await ctx.bot.send_message(
-            uid,
+            chat_id,
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"⚡ *BOOKING:  {entry['name'].upper()}*\n"
+            f"⚡ *BOOKING:  {fancy}*\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
             f"💎  Amount:  *GHS {entry['price']}*\n\n"
             f"Tap *PAY SECURELY NOW* to complete via Paystack.\n"
@@ -425,16 +414,17 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         reference = parts[1]
         lid       = int(parts[2])
         entry     = get_listing(lid)
-        await ctx.bot.send_message(uid, "🔍 _Verifying your payment…_", parse_mode="Markdown")
+        await ctx.bot.send_message(chat_id, "🔍 _Verifying your payment…_", parse_mode="Markdown")
         success = await verify_paystack(reference)
         if success:
-            name = entry["name"] if entry else "the listing"
+            name  = entry["name"] if entry else "the listing"
+            fancy = emojify_name(name, lid)
             await ctx.bot.send_message(
-                uid,
+                chat_id,
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"🎉 *PAYMENT CONFIRMED!*\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"Your booking for *{name}* is locked in.\n"
+                f"Your booking for {fancy} is locked in.\n"
                 f"You will be contacted shortly. ✅",
                 parse_mode="Markdown",
             )
@@ -456,7 +446,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("🔄 TRY AGAIN", callback_data=f"verify|{reference}|{lid}")
             ]])
             await ctx.bot.send_message(
-                uid,
+                chat_id,
                 "❌ *Payment not confirmed yet.*\n\n"
                 "If you've paid, wait a moment and tap *TRY AGAIN*.\n"
                 "Haven't paid yet? Complete payment first. 👆",
@@ -508,5 +498,5 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    print("✅ Catalog bot is running…")
+    print("✅ Catalog bot is running with MongoDB…")
     app.run_polling()
